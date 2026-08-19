@@ -1,0 +1,9 @@
+{
+  "preflight": "9ed457a8eb726c7c",
+  "policies": "42e2b62ed168a4210.0002|3",
+  "sweep": "42e2b62ed168a4210.0001|0.0005|0.001|0.005|0.01|0.1|3",
+  "abstention": "a2f186dbfda640c30.0002|3",
+  "classify": "a446e2fb6e66817f0.0002|3",
+  "figures": "c5b879e38a6041ed0.0002|310,25,29,34,adt_nuovoadt_nuovo",
+  "verify": "always"
+}

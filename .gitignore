@@ -1,0 +1,7 @@
+# The repository INCLUDES the generated results and figures (they are the
+# paper's numbers; the pipeline verifies them on every run). Only volatile
+# working files are ignored.
+__pycache__/
+*.pyc
+*.orig
+experiment/.sweep_stash/
