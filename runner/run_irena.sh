@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_VERSION="2026-08-19-v3"
+PACKAGE_VERSION="2026-10-03-v5"
 
 # Adaptive Vector-PREANA benchmark for PANACEA Experiment 3.
 #
@@ -33,7 +33,8 @@ PACKAGE_VERSION="2026-08-19-v3"
 #       [ATTACK_GOAL_BONUS] [RISK_MODE] [ATTACKER_POLICY] [LEARNING_MODE] \
 #       [TURN_ORDER] [DEFENDER_ABSTAIN] [DEFENDER_POLICY]
 #
-# Full model (defaults):
+# Full model, behavioural layer enabled (the defaults are instead the reported
+# minimal configuration -- neutral, learning off; see pipeline.py):
 #   ./run_irena.sh 20 0.0001 0.0001 60 40 0.70 1.0 dynamic adaptive on attacker_first off
 #
 # Fair-cost comparison against PANACEA (defender may decline to act):
@@ -46,7 +47,8 @@ PACKAGE_VERSION="2026-08-19-v3"
 #   ./run_irena.sh 20 0.0001 0.0001 60 40 0.70 1.0 neutral greedy off attacker_first
 #
 # ATTACKER_POLICY:
-#   greedy   = state-adaptive one-step heuristic used by the earlier prototype
+#   greedy   = state-adaptive one-step heuristic used by the earlier prototype;
+#              in the paper, the attacker that does not share IRENA's model
 #   adaptive = counterfactual Vector-PREANA attacker
 #
 # LEARNING_MODE:
@@ -60,15 +62,22 @@ PACKAGE_VERSION="2026-08-19-v3"
 #                    a realized attack is paired with that previous attack for learning.
 #
 # DEFENDER_POLICY:
-#   irena  full local-negotiation defender (default)
-#   lc     R-ADT LC baseline: the cheapest response enabled in the current
-#          state, as in the PANACEA evaluation
-#   ld     R-ADT LD baseline: the enabled response that blocks the precondition
-#          closest to the attacker root, irrespective of cost
+#   irena       full local-negotiation defender (default)
+#   lc          R-ADT LC baseline: the cheapest response enabled in the current
+#               state, as in the PANACEA evaluation
+#   ld          R-ADT LD baseline: among the responses whose target condition
+#               currently holds, the one closest to the attacker root, ties
+#               broken by cost (validated against the PANACEA artifact traces)
+#   onestep     negotiation ablation: each response is scored by the risk of the
+#               state it immediately produces, Risk(F_d(z)) + lambda_D*C_D(d),
+#               with no local game; everything else is IRENA's
+#   irena_loss  IRENA with a loss term in the defender score, symmetric to the
+#               attacker's goal bonus: Q_D(d) + B_g * [root holds in mu_d]
 #
-#   Only the DEFENDER changes. The attacker stays the adaptive counterfactual
-#   one, and the relational memory is still updated from the realized pair, so
-#   the three runs differ in exactly one factor and their costs are comparable.
+#   Only the DEFENDER changes. The attacker is the one ATTACKER_POLICY selects,
+#   and the relational memory is still updated from the realized pair, so runs
+#   with different defenders differ in exactly one factor and their costs are
+#   comparable.
 #
 # DEFENDER_ABSTAIN:
 #   off = defender always responds when any defense is enabled (original behaviour)
@@ -146,9 +155,9 @@ case "$DEFENDER_ABSTAIN" in
 esac
 
 case "$DEFENDER_POLICY" in
-  irena|lc|ld) ;;
+  irena|lc|ld|onestep|irena_loss) ;;
   *)
-    echo "ERROR: DEFENDER_POLICY must be 'irena', 'lc' or 'ld' (got: $DEFENDER_POLICY)" >&2
+    echo "ERROR: DEFENDER_POLICY must be 'irena', 'lc', 'ld', 'onestep' or 'irena_loss' (got: $DEFENDER_POLICY)" >&2
     exit 1
     ;;
 esac
@@ -659,8 +668,13 @@ class VectorPreana:
         learning_mode: str = "on",
         defender_abstain: str = "off",
         defender_policy: str = "irena",
+        loss_bonus: float = 0.0,
     ):
         self.m = model
+        # Weight of the defender-side loss term (policy irena_loss): a predicted
+        # medoid in which the root holds costs the defender this much extra,
+        # symmetric to the attacker's goal bonus B_g. Zero for every other policy.
+        self.loss_bonus = loss_bonus
         self.max_rounds = max_rounds
         self.eu_threshold = 0.015
         self.base_move = 0.35
@@ -1124,6 +1138,12 @@ class VectorPreana:
             0.0,
         )
 
+    def _loss_term(self, final_vec: Sequence[float]) -> float:
+        """B_g * [root holds in the predicted medoid]; 0 unless irena_loss."""
+        if not self.loss_bonus:
+            return 0.0
+        return self.loss_bonus * float(final_vec[self.m.dims.index(self.m.goal)])
+
     def _abstain_record(
         self,
         state: Mapping[str, int],
@@ -1148,7 +1168,8 @@ class VectorPreana:
         for attack in remaining_attacks:
             players.append(self._attack_player(state, attack))
 
-        if not remaining_attacks:
+        if not remaining_attacks or self.defender_policy == "onestep":
+            # onestep: no local game; the no-op proposes the current state.
             final_vec = self.m.vector(state)
             rounds = 0
             medoid = "status_quo"
@@ -1165,7 +1186,7 @@ class VectorPreana:
         residual_risk = self.m.risk(final_vec)
         return {
             "action": None,
-            "score": residual_risk,
+            "score": residual_risk + self._loss_term(final_vec),
             "predicted_risk": residual_risk,
             "cost": 0.0,
             "rounds": rounds,
@@ -1276,7 +1297,8 @@ class VectorPreana:
                 state, defense, executed
             )
             remaining_attacks = self.m.enabled_attacks(defended, executed)
-            if not remaining_attacks:
+            if not remaining_attacks or self.defender_policy == "onestep":
+                # onestep: no local game; mu is the response's own proposal.
                 final_vec = self.m.vector(defended)
                 rounds = 0
                 medoid = f"D:{defense}"
@@ -1289,7 +1311,8 @@ class VectorPreana:
             else:
                 final_vec, rounds, medoid, risk_diag = self.run(players, memory)
             residual_risk = self.m.risk(final_vec)
-            score = residual_risk + cost_weight * self.m.defense_cost[defense]
+            score = (residual_risk + self._loss_term(final_vec)
+                     + cost_weight * self.m.defense_cost[defense])
             records.append(
                 {
                     "action": defense,
@@ -1483,6 +1506,7 @@ def run_episode(
         learning_mode=learning_mode,
         defender_abstain=defender_abstain,
         defender_policy=defender_policy,
+        loss_bonus=attack_goal_bonus if defender_policy == "irena_loss" else 0.0,
     )
     memory = RelationalMemory(beta=vp.beta)
     memory.tag_fn = m.player_branch_tag
@@ -1527,7 +1551,7 @@ def run_episode(
     def plan_defense():
         nonlocal defender_planning_time, defender_rounds
         t0 = time.perf_counter()
-        if defender_policy == "irena":
+        if defender_policy in ("irena", "onestep", "irena_loss"):
             action, meta = vp.choose_defense(
                 state, executed, defense_cost_weight, memory
             )
@@ -1881,7 +1905,7 @@ def main():
         default="attacker_first",
     )
     ap.add_argument("--defender-abstain", choices=["on", "off"], default="off")
-    ap.add_argument("--defender-policy", choices=["irena", "lc", "ld"],
+    ap.add_argument("--defender-policy", choices=["irena", "lc", "ld", "onestep", "irena_loss"],
                     default="irena")
     args = ap.parse_args()
 
