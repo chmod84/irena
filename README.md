@@ -22,7 +22,8 @@ pip install -r requirements.txt     # pandas, numpy, matplotlib, lxml, networkx
 
 That single command runs every experiment of the evaluation in dependency
 order — the three defense policies, the λ_D sweep, the abstention study, the
-victory attribution, the figures — and ends with a verification pass. Read
+victory attribution, the ablations, the figures — and ends with a
+verification pass. Read
 `experiment/reports/MANIFEST.md` when it finishes: one PASS/FAIL line per
 claim, plus the outcome/cost table. `python3 pipeline.py status` shows what
 would run without executing anything. Full expected numbers, per-stage manual
@@ -40,7 +41,8 @@ experiment/
   ...                     everything the pipeline writes lands here
                           (CSVs, traces, figures/, reports/)
 runner/
-  run_irena.sh            the simulator: IRENA, R-ADT LC, R-ADT LD
+  run_irena.sh            the simulator: IRENA, R-ADT LC, R-ADT LD, and the
+                          two ablation defenders (onestep, irena_loss)
   patch_ld_rule.py        one-shot fix, already applied to run_irena.sh
 analysis/
   make_run_figures.py     every figure: IRENA/LC/LD from the experiment
@@ -49,6 +51,7 @@ analysis/
   make_figures.py         the plotting/loading library behind it
   compare_abstention.py   abstention study report
   classify_terminations.py  victory attribution (blocked/exhausted)
+  ablations.py            negotiation ablation and attacker-mismatch report
   smoke_figures.py        quick visual test of the figure code
 diagnostics/
   diagnose_tree.py        inspect one R-ADT instance; never invoked
