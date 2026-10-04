@@ -44,6 +44,10 @@ STAGES, in order:
               on failure -- the manual backup/restore dance, automated.
   abstention  the abstain=on run plus compare_abstention.py, report saved.
   classify    classify_terminations.py over the IRENA traces, report saved.
+  ablations   negotiation ablation and attacker mismatch: the one-step
+              defender at every ablation lambda_D; the greedy attacker against
+              IRENA, LD, one-step and IRENA with the loss term; that loss term
+              against the adaptive attacker. Report saved.
   figures     the paper figures, with the paper's perf/cost exclusions.
   verify      cross-checks the numbers and writes reports/MANIFEST.md: the one
               file to read (or send) after a run.
@@ -93,6 +97,8 @@ DEFAULTS: Dict[str, object] = {
     # the reported configuration ------------------------------------------
     "operating_lambda": 2e-4,
     "sweep_lambdas": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 1e-1],
+    # negotiation ablation: the one-step defender at these weights
+    "ablation_lambdas": [1e-4, 2e-4, 5e-4],
     "repeats": 3,
     "attack_lambda": 1e-4,
     "max_steps": 60,
@@ -205,7 +211,16 @@ def runner_args(cfg: Dict[str, object], lam: float, abstain: str,
 
 
 def policy_csv(cfg: Dict[str, object], policy: str, abstain: str = "off") -> Path:
-    if (policy == "irena" and abstain == "off"):
+    """The summary CSV the runner writes for this configuration.
+
+    Same rule as run_irena.sh: only the canonical configuration with the IRENA
+    defender gets the plain name; everything else is suffixed.
+    """
+    canonical = (cfg["risk_mode"] == "neutral"
+                 and cfg["attacker_policy"] == "adaptive"
+                 and cfg["learning_mode"] == "off"
+                 and cfg["turn_order"] == "attacker_first")
+    if canonical and policy == "irena" and abstain == "off":
         return EXP / "vector_preana_result.csv"
     suffix = (f"{cfg['risk_mode']}_{cfg['attacker_policy']}"
               f"_learning_{cfg['learning_mode']}_{cfg['turn_order']}")
@@ -380,6 +395,100 @@ def classify_run(cfg: Dict) -> None:
                            "see reports/classify.txt")
 
 
+def greedy_cfg(cfg: Dict) -> Dict:
+    """The reported configuration with the greedy one-step attacker."""
+    return dict(cfg, attacker_policy="greedy")
+
+
+def results_dir(csv_path: Path) -> Path:
+    """The trace directory that goes with a summary CSV."""
+    n = csv_path.name
+    if n.endswith("_result.csv"):
+        return csv_path.parent / (n[: -len("_result.csv")] + "_results")
+    return csv_path.parent / (n[: -len(".csv")] + "_results")
+
+
+def ablation_files(cfg: Dict) -> Dict[str, Path]:
+    """Every CSV the ablations stage produces, by label."""
+    files = {f"onestep@{float(l):g}":
+             EXP / f"ablation_onestep_lambdaD_{float(l):g}.csv"
+             for l in cfg["ablation_lambdas"]}
+    files["irena_loss"] = policy_csv(cfg, "irena_loss")
+    for pol in ("irena", "ld", "onestep", "irena_loss"):
+        files[f"greedy/{pol}"] = policy_csv(greedy_cfg(cfg), pol)
+    return files
+
+
+ABLATION_LABELS = {"irena_loss": "IRENA + loss term (adaptive attacker)",
+                   "greedy/irena": "greedy attacker vs IRENA",
+                   "greedy/ld": "greedy attacker vs R-ADT LD",
+                   "greedy/onestep": "greedy attacker vs one-step",
+                   "greedy/irena_loss": "greedy attacker vs IRENA + loss term"}
+
+
+def ablation_label(key: str) -> str:
+    if key.startswith("onestep@"):
+        return f"one-step defender, lambda_D = {key.split('@')[1]}"
+    return ABLATION_LABELS.get(key, key)
+
+
+def ablations_ok(cfg: Dict) -> Optional[str]:
+    lam = float(cfg["operating_lambda"])
+    for key, path in ablation_files(cfg).items():
+        want = float(key.split("@")[1]) if key.startswith("onestep@") else lam
+        if not csv_covers(path, cfg["trees"], want):
+            return f"{path.name}: missing, incomplete, or at the wrong lambda_D"
+    if not (REPORTS / "ablations.txt").exists():
+        return "reports/ablations.txt missing"
+    return None
+
+
+def ablations_run(cfg: Dict) -> None:
+    """Negotiation ablation and attacker mismatch.
+
+    The one-step runs land on the same runner paths whatever lambda_D is (as
+    in the sweep), so each CSV and its traces are moved to
+    ablation_onestep_lambdaD_<l>.csv / ..._results before the next run. The
+    greedy-attacker and loss-term runs have configuration-specific paths.
+    """
+    lam = float(cfg["operating_lambda"])
+    files = ablation_files(cfg)
+    run_csv = policy_csv(cfg, "onestep")
+    for l in (float(x) for x in cfg["ablation_lambdas"]):
+        dest = files[f"onestep@{l:g}"]
+        if csv_covers(dest, cfg["trees"], l):
+            print(f"    one-step at lambda_D={l:g}: present, skipping")
+            continue
+        if sh(runner_args(cfg, l, "off", "onestep"), cwd=HERE,
+              log=REPORTS / f"ablation_onestep_{l:g}.log"):
+            raise RuntimeError(f"one-step run at {l:g} failed; "
+                               f"see reports/ablation_onestep_{l:g}.log")
+        if results_dir(dest).exists():
+            shutil.rmtree(results_dir(dest))
+        shutil.move(str(run_csv), str(dest))
+        shutil.move(str(results_dir(run_csv)), str(results_dir(dest)))
+    jobs = [("irena_loss", cfg, "irena_loss")] + \
+        [(f"greedy/{p}", greedy_cfg(cfg), p)
+         for p in ("irena", "ld", "onestep", "irena_loss")]
+    for key, c, pol in jobs:
+        if csv_covers(files[key], cfg["trees"], lam):
+            print(f"    {key}: present, skipping")
+            continue
+        log = REPORTS / f"ablation_{key.replace('/', '_')}.log"
+        if sh(runner_args(c, lam, "off", pol), cwd=HERE, log=log):
+            raise RuntimeError(f"{key} run failed; see reports/{log.name}")
+    if sh(["python3", str(ANALYSIS / "ablations.py"),
+           "--experiment-dir", str(EXP), "--trees", *cfg["trees"],
+           "--operating-lambda", f"{lam:g}",
+           "--ablation-lambdas",
+           *[f"{float(l):g}" for l in cfg["ablation_lambdas"]],
+           "--risk-mode", str(cfg["risk_mode"]),
+           "--learning-mode", str(cfg["learning_mode"]),
+           "--turn-order", str(cfg["turn_order"])],
+          cwd=HERE, log=REPORTS / "ablations.txt"):
+        raise RuntimeError("ablations.py failed; see reports/ablations.txt")
+
+
 def figures_ok(cfg: Dict) -> Optional[str]:
     figdir = EXP / "figures"
     # The exact names the paper's main.tex includes, so a reviewer can point
@@ -468,6 +577,61 @@ def verify_run(cfg: Dict) -> None:
     else:
         checks.append("- SKIP  paper-specific invariants (paper_checks=false)")
 
+    # ---- ablations (paper: Negotiation Ablation; Limitations) -------------
+    abl = ablation_files(cfg)
+
+    def by_tree(path: Path) -> Dict[str, Dict[str, str]]:
+        return {Path(str(r["tree"])).stem: r for r in read_csv_rows(path)}
+
+    def outcome(r):
+        return (r["winner"], float(r["defender_cost"])) if r else None
+
+    def moves(path: Path, tree: str):
+        tj = results_dir(path) / tree / f"{tree}_trace.json"
+        return trace_actions(tj) if tj.exists() else None
+
+    abl_rows = {k: by_tree(p) for k, p in abl.items()}
+    have = all(csv_covers(p, cfg["trees"], None) for p in abl.values())
+    check("ablation outputs present (one-step, greedy attacker, loss term)", have)
+    if have and cfg.get("paper_checks", True):
+        T, ir, ldr = cfg["trees"], rows["irena"], rows["ld"]
+        lams = [float(l) for l in cfg["ablation_lambdas"]]
+        check("no tested lambda_D lets the one-step defender match IRENA",
+              all(any(outcome(abl_rows[f"onestep@{l:g}"].get(t))
+                      != outcome(ir.get(t)) for t in T) for l in lams))
+        if 1e-4 in lams:
+            check("at lambda_D = 1e-4 the one-step defender reproduces "
+                  "R-ADT LD move for move",
+                  all(moves(abl["onestep@0.0001"], t)
+                      == moves(policy_csv(cfg, "ld"), t) for t in T))
+        op = abl_rows.get(f"onestep@{lam:g}")
+        if op:
+            same = [t for t in T if outcome(op.get(t)) == outcome(ir.get(t))]
+            check("at the operating point the one-step defender matches IRENA "
+                  "on 10, 25 and adt_nuovo, spends more on 29, loses 34",
+                  same == ["10", "25", "adt_nuovo"]
+                  and op["29"]["winner"] == "defender"
+                  and float(op["29"]["defender_cost"])
+                  > float(ir["29"]["defender_cost"])
+                  and op["34"]["winner"] == "attacker",
+                  "matches IRENA on: " + (", ".join(same) or "none"))
+            adaptive = {"irena": ir, "ld": ldr, "onestep": op}
+            check("greedy attacker: IRENA, LD and one-step keep outcome and "
+                  "cost on every instance but 34",
+                  all(outcome(abl_rows[f"greedy/{p}"].get(t))
+                      == outcome(adaptive[p].get(t))
+                      for p in adaptive for t in T if t != "34"))
+            check("greedy attacker: IRENA, LD and one-step all lose the "
+                  "34-node instance",
+                  all(abl_rows[f"greedy/{p}"]["34"]["winner"] == "attacker"
+                      for p in adaptive))
+        check("loss term: IRENA with the loss term reproduces IRENA move for move",
+              all(moves(abl["irena_loss"], t) == moves(policy_csv(cfg, "irena"), t)
+                  for t in T))
+        check("loss term: the 34-node instance is defended against the greedy "
+              "attacker",
+              abl_rows["greedy/irena_loss"]["34"]["winner"] == "defender")
+
     # the sweep and the operating point must agree where they overlap
     ok_line = (REPORTS / "figures.txt").exists() and \
         f"lambda_D={lam:g}" in (REPORTS / "figures.txt").read_text(
@@ -499,8 +663,17 @@ def verify_run(cfg: Dict) -> None:
                          f"({'W' if r['winner'] == 'defender' else 'L'})"
                          if r else "--")
         lines.append(f"| {t} | " + " | ".join(cells) + " |")
+    lines += ["", "## Ablations (detail in reports/ablations.txt)", "",
+              "| run | " + " | ".join(cfg["trees"]) + " |",
+              "|---|" + "---|" * len(cfg["trees"])]
+    for key, path in ablation_files(cfg).items():
+        rws = {Path(str(r["tree"])).stem: r for r in read_csv_rows(path)}
+        cells = [f"{float(rws[t]['defender_cost']):g} "
+                 f"({'W' if rws[t]['winner'] == 'defender' else 'L'})"
+                 if t in rws else "--" for t in cfg["trees"]]
+        lines.append(f"| {ablation_label(key)} | " + " | ".join(cells) + " |")
     lines += ["", "## Reports", ""]
-    for name in ("abstention.txt", "classify.txt", "figures.txt"):
+    for name in ("abstention.txt", "classify.txt", "ablations.txt", "figures.txt"):
         lines.append(f"- reports/{name}"
                      + ("" if (REPORTS / name).exists() else "  (missing)"))
     (REPORTS / "MANIFEST.md").write_text("\n".join(lines) + "\n",
@@ -536,6 +709,13 @@ def build_stages(cfg: Dict) -> List[Stage]:
               lambda c: file_hash(ANALYSIS / "classify_terminations.py",
                                   policy_csv(c, "irena")) + lam_key,
               classify_ok, classify_run),
+        Stage("ablations", ["policies"],
+              lambda c: file_hash(RUNNER, ANALYSIS / "ablations.py",
+                                  ANALYSIS / "panacea_reference.py", *trees,
+                                  policy_csv(c, "irena"), policy_csv(c, "ld"))
+              + lam_key + "|"
+              + "|".join(f"{float(l):g}" for l in c["ablation_lambdas"]),
+              ablations_ok, ablations_run),
         Stage("figures", ["policies", "sweep"],
               lambda c: file_hash(
                   ANALYSIS / "make_run_figures.py",
@@ -546,7 +726,8 @@ def build_stages(cfg: Dict) -> List[Stage]:
               + lam_key + ",".join(c["trees"]) + ",".join(c["cost_exclude"])
               + ",".join(c["perf_exclude"]),
               figures_ok, figures_run),
-        Stage("verify", ["policies", "abstention", "classify", "figures"],
+        Stage("verify", ["policies", "abstention", "classify", "ablations",
+                         "figures"],
               lambda c: "always",
               lambda c: None if (REPORTS / "MANIFEST.md").exists()
               else "reports/MANIFEST.md missing",
