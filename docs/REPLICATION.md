@@ -7,7 +7,7 @@ beyond a Linux machine and basic command-line use.
 The package is self-contained and runs IRENA-side experiments only. It ships
 the five R-ADT instances and the XML parser; every simulated experiment —
 IRENA and both rule baselines, the λ_D sweep, the abstention study, the
-victory attribution — and every figure is recomputed on your machine, on any
+victory attribution, the ablations — and every figure is recomputed on your machine, on any
 laptop, in roughly 30–45 minutes. Nothing in the package executes or models
 PANACEA: the reference values the comparison uses (proven minimum defense
 costs, model sizes, solver time and memory) are declared constants in
@@ -31,8 +31,10 @@ experiment/
   trees/*.xml             the five R-ADT instances
   reports/                written by the pipeline: logs + MANIFEST.md
   figures/                written by the pipeline
-runner/run_irena.sh       simulator: IRENA / R-ADT LC / R-ADT LD
-analysis/                 figures, abstention report, attribution, and the
+runner/run_irena.sh       simulator: IRENA / R-ADT LC / R-ADT LD, plus the
+                          ablation defenders onestep and irena_loss
+analysis/                 figures, abstention, attribution and ablation
+                          reports, and the
                           declared PANACEA reference values (see §7)
 diagnostics/              optional inspection tools
 ```
@@ -55,12 +57,12 @@ executing: one line per stage. Should the copy you received already contain
 simulated results (every stage `ok`), reproduce them from scratch with
 
 ```bash
-python3 pipeline.py run --force policies sweep abstention classify figures verify
+python3 pipeline.py run --force policies sweep abstention classify ablations figures verify
 ```
 
 `run` executes, logging each stage to `experiment/reports/<stage>.log`. On a
 laptop expect roughly: policies ~10 min, sweep ~15–25 min (six extra λ_D
-values across five instances), abstention ~5 min, everything else seconds.
+values across five instances), abstention ~5 min, ablations ~10 min, everything else seconds.
 
 When it finishes, read **`experiment/reports/MANIFEST.md`**. It contains a
 PASS/FAIL line for every invariant the paper claims (see §5) and the
@@ -125,6 +127,25 @@ adt_nuovo, undoing the defenses reopens exactly `bufferOverflow` and
 adt_nuovo reproduce, action for action, the reference traces distributed with
 the PANACEA artifact (LC spends 65 and loses; LD spends 330 and wins).
 
+**Ablations** (`reports/ablations.txt`; the paper's *Negotiation Ablation*
+and *Limitations*). The one-step defender keeps everything of IRENA except the
+local game: each response is scored by the risk of the state it immediately
+produces, plus its cost. Defense cost and outcome, adaptive attacker:
+
+| one-step at λ_D | 10 | 25 | 29 | 34 | adt_nuovo |
+|---|---|---|---|---|---|
+| 10⁻⁴ | 90 (W) | 660 (W) | 280 (W) | 780 (W) | 330 (W) |
+| 2×10⁻⁴ | 90 (W) | 180 (W) | 280 (W) | 320 (L) | 170 (W) |
+| 5×10⁻⁴ | 90 (W) | 180 (W) | 280 (W) | 320 (L) | 70 (L) |
+
+At 10⁻⁴ it reproduces R-ADT LD move for move on all five instances; no tested
+weight lets it match IRENA. Against the greedy one-step attacker (λ_D =
+2×10⁻⁴), IRENA, LD and the one-step defender keep the outcome and cost of the
+adaptive-attacker runs on four instances and all lose the 34-node one; IRENA
+with the loss term (`irena_loss`) reproduces IRENA move for move against the
+adaptive attacker and defends the 34-node instance against the greedy one
+(740, W).
+
 **Figures.** `experiment/figures/` contains, under the exact names the
 paper's LaTeX includes: `perf_state_space.pdf`, `perf_planning_time.pdf`,
 `perf_peak_memory.pdf` (performance, synthetic suite 10–34) and
@@ -173,6 +194,25 @@ python3 analysis/compare_abstention.py
 python3 analysis/classify_terminations.py --repo-root . \
         --results-dir experiment/vector_preana_results
 ```
+
+**ablations** — the one-step defender at each λ_D of `ablation_lambdas`
+(default 10⁻⁴, 2×10⁻⁴, 5×10⁻⁴); the greedy attacker against IRENA, LD, the
+one-step defender and IRENA with the loss term; that loss term against the
+adaptive attacker:
+
+```bash
+bash runner/run_irena.sh 3 0.0002 0.0001 60 40 0.70 1.0 \
+     neutral adaptive off attacker_first off onestep    # also 0.0001, 0.0005
+bash runner/run_irena.sh 3 0.0002 0.0001 60 40 0.70 1.0 \
+     neutral greedy off attacker_first off irena        # then ld, onestep, irena_loss
+bash runner/run_irena.sh 3 0.0002 0.0001 60 40 0.70 1.0 \
+     neutral adaptive off attacker_first off irena_loss
+python3 analysis/ablations.py
+```
+
+As in the sweep, one-step runs at different λ_D write the same output paths:
+the pipeline moves each to `experiment/ablation_onestep_lambdaD_<λ>.csv` (and
+its traces to `..._results/`) before the next one.
 
 **figures**:
 
